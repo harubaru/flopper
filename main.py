@@ -89,7 +89,7 @@ def main():
     rank = get_rank()
     torch.cuda.set_device(rank)
     # use dummy resnet8 model
-    dummy_model = torch.hub.load('pytorch/vision:v0.6.0', 'resnet18', pretrained=False).cuda()
+    dummy_model = torch.hub.load('pytorch/vision', 'resnet18', pretrained=False).cuda()
     dummy_input = torch.randn(args.batch_size, 3, 224, 224).cuda()
     macs, params = profile(dummy_model, inputs=(dummy_input, ))
     if rank == 0:
