@@ -6,12 +6,14 @@ from thop import profile
 torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--steps", type=int, default=100)
+parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
+parser.add_argument("--backend", type=str, default="nccl")
 args = parser.parse_args()
 
 def setup():
-    torch.distributed.init_process_group("nccl", init_method="env://")
+    torch.distributed.init_process_group(args.backend, init_method="env://")
 
 def cleanup():
     torch.distributed.destroy_process_group()
@@ -26,39 +28,32 @@ def get_world_size() -> int:
         return 1
     return torch.distributed.get_world_size()
 
-class DummyModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.block = torch.nn.Linear(2048, 2048)
-        self.out = torch.nn.Linear(2048, 1)
-
-    def forward(self, x):
-        x = self.block(x)
-        x = self.out(x)
-        return x
-
 def effective_flops(macs: float, elapsed: float, batch_size: int) -> float:
-    return (macs * 2 * 3 * batch_size) / elapsed
+    return (macs * args.gradient_accumulation_steps * 2 * 3 * batch_size) / elapsed
 
 def training_test(model: torch.nn.Module, optimizer: torch.optim.Optimizer, data: torch.Tensor, steps: int) -> float:
-    def step(data):
+    def step(data, gradient_accumulation_steps=args.gradient_accumulation_steps):
+        s_start = time.perf_counter()
         optimizer.zero_grad()
-        f_start = time.process_time()
-        output = model(data)
-        f_end = time.process_time()
-        loss = output.sum()
+        loss = torch.tensor(0.0).cuda()
+        for _ in range(gradient_accumulation_steps):
+            f_start = time.perf_counter()
+            output = model(data)
+            loss += output.sum()
+            f_end = time.perf_counter()
         loss.backward()
         optimizer.step()
-        b_end = time.process_time()
+        optimizer.zero_grad()
+        b_end = time.perf_counter()
         torch.distributed.all_reduce(loss)
-        r_end = time.process_time()
+        r_end = time.perf_counter()
 
         # f_start - start of forward pass
         # f_end - end of forward pass
         # b_end - end of backward pass
         # r_end - end of reduction
 
-        return r_end - f_start, f_end - f_start, b_end - f_end, r_end - b_end
+        return r_end - s_start, f_end - f_start, b_end - f_end, r_end - b_end
     step(data[0]) # run first step to allocate memory for more accurate timing
     times = []
     latencies = []
@@ -73,7 +68,7 @@ def inference_test(model: torch.nn.Module, data: torch.Tensor, steps: int) -> fl
     def step(data):
         with torch.no_grad():
             f_start = time.process_time()
-            output = model(data)
+            _ = model(data)
             return time.process_time() - f_start
     step(data[0]) # run first step to allocate memory for more accurate timing
     times = []
@@ -93,8 +88,9 @@ def device_printout():
 def main():
     rank = get_rank()
     torch.cuda.set_device(rank)
-    dummy_model = DummyModel()
-    dummy_input = torch.randn(1, 2048, 2048)
+    # use dummy resnet8 model
+    dummy_model = torch.hub.load('pytorch/vision:v0.6.0', 'resnet18', pretrained=False).cuda()
+    dummy_input = torch.randn(args.batch_size, 3, 224, 224).cuda()
     macs, params = profile(dummy_model, inputs=(dummy_input, ))
     if rank == 0:
         print(f"macs: {macs}, Params: {params}")
@@ -103,7 +99,7 @@ def main():
     batch_size = args.batch_size
     
     # create a "steps" amount of dummy data with batch size 8
-    inputs = [torch.randn(batch_size, 2048, 2048).cuda() for _ in range(steps)]
+    inputs = [torch.randn(batch_size, 3, 224, 224).cuda() for _ in range(steps)]
 
     training_time, latencies = training_test(
         model=dummy_model.to('cuda'),
@@ -130,7 +126,7 @@ def main():
         print(f"Effective Global TFLOPS: {(effective_flops(macs, training_time, batch_size)*get_world_size())/1e12}")
         print(f"Effective Rank TFLOPS: {(effective_flops(macs, training_time, batch_size))/1e12}\n")
         print("--Inference FLOPS Metrics--")
-        print(f"Effective Rank TFLOPS: {(effective_flops(macs, inference_time, batch_size)/3)/1e12}\n")
+        print(f"Effective Rank TFLOPS: {(effective_flops(macs, inference_time, batch_size)/3/args.gradient_accumulation_steps)/1e12}\n")
 
 if __name__ == "__main__":
     setup()
